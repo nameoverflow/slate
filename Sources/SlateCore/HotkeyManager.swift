@@ -172,3 +172,80 @@ public final class HotkeyManager {
         }
     }
 }
+
+/// Temporary global Escape hotkey used only while a capture overlay is visible.
+public final class EscapeCancelHotkey {
+    private static let signature: OSType = 0x534C5445 // 'SLTE'
+    private static let idValue: UInt32 = 2
+
+    private var eventHandlerRef: EventHandlerRef?
+    private var hotKeyRef: EventHotKeyRef?
+    public var onEscape: (() -> Void)?
+
+    public init() {
+        installEventHandler()
+    }
+
+    deinit {
+        unregister()
+        if let handler = eventHandlerRef {
+            RemoveEventHandler(handler)
+        }
+    }
+
+    public func register() {
+        guard hotKeyRef == nil else { return }
+        let hotKeyID = EventHotKeyID(signature: Self.signature, id: Self.idValue)
+        var newRef: EventHotKeyRef?
+        let status = RegisterEventHotKey(
+            UInt32(kVK_Escape),
+            0,
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &newRef
+        )
+        if status == noErr {
+            hotKeyRef = newRef
+        }
+    }
+
+    public func unregister() {
+        if let ref = hotKeyRef {
+            UnregisterEventHotKey(ref)
+            hotKeyRef = nil
+        }
+    }
+
+    private func installEventHandler() {
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        let userData = Unmanaged.passUnretained(self).toOpaque()
+        let callback: EventHandlerUPP = { _, event, userData in
+            guard let userData = userData, let event = event else {
+                return OSStatus(eventNotHandledErr)
+            }
+            var hotKeyID = EventHotKeyID()
+            let err = GetEventParameter(
+                event,
+                EventParamName(kEventParamDirectObject),
+                EventParamType(typeEventHotKeyID),
+                nil,
+                MemoryLayout<EventHotKeyID>.size,
+                nil,
+                &hotKeyID
+            )
+            if err == noErr && hotKeyID.signature == EscapeCancelHotkey.signature && hotKeyID.id == EscapeCancelHotkey.idValue {
+                let instance = Unmanaged<EscapeCancelHotkey>.fromOpaque(userData).takeUnretainedValue()
+                DispatchQueue.main.async {
+                    instance.onEscape?()
+                }
+                return noErr
+            }
+            return OSStatus(eventNotHandledErr)
+        }
+        InstallEventHandler(GetApplicationEventTarget(), callback, 1, &eventType, userData, &eventHandlerRef)
+    }
+}

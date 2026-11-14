@@ -1,14 +1,22 @@
 import AppKit
+import Carbon.HIToolbox
 import Foundation
 import UniformTypeIdentifiers
 
 public final class CaptureOverlayWindow: NSWindow {
+    public var onCancel: (() -> Void)?
     public override var canBecomeKey: Bool { true }
     public override var canBecomeMain: Bool { true }
+
+    public override func cancelOperation(_ sender: Any?) {
+        onCancel?()
+    }
 }
 
 public final class CaptureCoordinator {
     private let captureService = ScreenCaptureService()
+    private let escapeHotkey = EscapeCancelHotkey()
+    private var localKeyMonitor: Any?
     private var overlayWindows: [CaptureOverlayWindow] = []
     private var canvasViews: [CaptureCanvasView] = []
     private var isCapturing = false
@@ -85,6 +93,17 @@ public final class CaptureCoordinator {
             canvas.onCancel = { [weak self] in
                 self?.teardownOverlays()
             }
+            canvas.onTextEditingChanged = { [weak self] editing in
+                guard let self = self else { return }
+                if editing {
+                    self.escapeHotkey.unregister()
+                } else if self.isCapturing {
+                    self.escapeHotkey.register()
+                }
+            }
+            win.onCancel = { [weak self] in
+                self?.teardownOverlays()
+            }
 
             win.contentView = canvas
             overlayWindows.append(win)
@@ -95,6 +114,21 @@ public final class CaptureCoordinator {
             }
         }
 
+        escapeHotkey.onEscape = { [weak self] in
+            self?.handleEscapeCancel()
+        }
+        escapeHotkey.register()
+
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self, self.isCapturing else { return event }
+            if event.keyCode == UInt16(kVK_Escape), !self.canvasViews.contains(where: { $0.isTextEditingActive }) {
+                self.teardownOverlays()
+                return nil
+            }
+            return event
+        }
+
+        NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
         NSApp.activate(ignoringOtherApps: true)
         for win in overlayWindows {
             win.orderFrontRegardless()
@@ -106,7 +140,21 @@ public final class CaptureCoordinator {
     }
 
     @MainActor
+    private func handleEscapeCancel() {
+        guard isCapturing else { return }
+        if canvasViews.contains(where: { $0.isTextEditingActive }) {
+            return
+        }
+        teardownOverlays()
+    }
+
+    @MainActor
     private func teardownOverlays(resetFlag: Bool = true) {
+        escapeHotkey.unregister()
+        if let monitor = localKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+            localKeyMonitor = nil
+        }
         for win in overlayWindows {
             win.orderOut(nil)
             win.close()

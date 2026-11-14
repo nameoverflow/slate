@@ -117,6 +117,9 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
     public var onCompleteWithCopy: ((CGImage) -> Void)?
     public var onCompleteWithSave: ((CGImage) -> Void)?
     public var onCancel: (() -> Void)?
+    public var onTextEditingChanged: ((Bool) -> Void)?
+
+    public var isTextEditingActive: Bool { activeTextView != nil }
 
     public private(set) var phase: CapturePhase = .selecting
     private var isInactiveOtherScreen = false
@@ -625,6 +628,14 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
 
     // MARK: - Keyboard Handling
 
+    public override func cancelOperation(_ sender: Any?) {
+        if activeTextView != nil {
+            cancelActiveTextIfNeeded()
+        } else {
+            onCancel?()
+        }
+    }
+
     public override func keyDown(with event: NSEvent) {
         if event.keyCode == UInt16(kVK_Escape) {
             if activeTextView != nil {
@@ -707,6 +718,7 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
         activeTextView = tv
         activeTextOrigin = CGPoint(x: originX, y: originY)
         activeTextFontSize = fontSize
+        onTextEditingChanged?(true)
 
         window?.makeFirstResponder(tv)
     }
@@ -749,14 +761,19 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
         container.removeFromSuperview()
         activeTextView = nil
         activeTextContainer = nil
+        onTextEditingChanged?(false)
         window?.makeFirstResponder(self)
         needsDisplay = true
     }
 
     private func cancelActiveTextIfNeeded() {
+        let wasEditing = activeTextView != nil
         activeTextContainer?.removeFromSuperview()
         activeTextView = nil
         activeTextContainer = nil
+        if wasEditing {
+            onTextEditingChanged?(false)
+        }
         window?.makeFirstResponder(self)
     }
 

@@ -380,6 +380,64 @@ func testLaunchAtLoginManagerEnableDisable() throws {
     check(!FileManager.default.fileExists(atPath: plistURL.path), "Plist removed")
 }
 
+func testCanvasEscapeCancelsInSelectingAndEditing() {
+    guard let screen = NSScreen.screens.first else {
+        check(false, "Need at least one NSScreen for Escape test")
+        return
+    }
+    let boundsSize = NSSize(width: 800, height: 600)
+    let winRect = CGRect(x: 100, y: 100, width: 300, height: 200)
+    let captured = CapturedScreen(
+        screen: screen,
+        displayID: CGMainDisplayID(),
+        image: makeDummyCGImage(pxW: 1600, pxH: 1200),
+        localWindows: [winRect]
+    )
+
+    let window = CaptureOverlayWindow(
+        contentRect: NSRect(origin: .zero, size: boundsSize),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    let canvas = CaptureCanvasView(capturedScreen: captured, frame: NSRect(origin: .zero, size: boundsSize))
+    window.contentView = canvas
+
+    var cancelCount = 0
+    canvas.onCancel = { cancelCount += 1 }
+    window.onCancel = { cancelCount += 1 }
+
+    // 1. Esc via keyDown during .selecting
+    let escEvt = NSEvent.keyEvent(
+        with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0.1,
+        windowNumber: window.windowNumber, context: nil, characters: "\u{1b}",
+        charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: UInt16(kVK_Escape)
+    )!
+    canvas.keyDown(with: escEvt)
+    checkEqual(cancelCount, 1, "Esc keyDown cancels in selecting phase")
+
+    // 2. Esc via cancelOperation during .editing
+    let moveEvt = NSEvent.mouseEvent(
+        with: .mouseMoved, location: CGPoint(x: 200, y: 200), modifierFlags: [],
+        timestamp: 0.2, windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 0, pressure: 0
+    )!
+    let downEvt = NSEvent.mouseEvent(
+        with: .leftMouseDown, location: CGPoint(x: 200, y: 200), modifierFlags: [],
+        timestamp: 0.25, windowNumber: window.windowNumber, context: nil, eventNumber: 2, clickCount: 1, pressure: 1
+    )!
+    let upEvt = NSEvent.mouseEvent(
+        with: .leftMouseUp, location: CGPoint(x: 200, y: 200), modifierFlags: [],
+        timestamp: 0.3, windowNumber: window.windowNumber, context: nil, eventNumber: 3, clickCount: 1, pressure: 0
+    )!
+    canvas.mouseMoved(with: moveEvt)
+    canvas.mouseDown(with: downEvt)
+    canvas.mouseUp(with: upEvt)
+    check(canvas.phase == .editing, "Entered editing phase")
+
+    canvas.cancelOperation(nil)
+    checkEqual(cancelCount, 2, "cancelOperation cancels in editing phase")
+}
+
 // Initialize NSApplication for AppKit view tests
 _ = NSApplication.shared
 
@@ -397,6 +455,7 @@ testHotkeyComboDisplayString()
 testCanvasClickWindowAndDoubleClickCopy()
 testCanvasDragCustomRectAndEnterCopy()
 testToolbarButtonDimensionsAndSnapshot(outputPath: renderPath)
+testCanvasEscapeCancelsInSelectingAndEditing()
 do {
     try testLaunchAtLoginManagerEnableDisable()
 } catch {
@@ -404,7 +463,7 @@ do {
 }
 
 if failureCount == 0 {
-    print("All 10 SlateTests passed.")
+    print("All 11 SlateTests passed.")
     exit(0)
 } else {
     fputs("\(failureCount) assertion(s) failed.\n", stderr)
