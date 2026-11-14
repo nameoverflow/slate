@@ -8,6 +8,10 @@ public final class CaptureOverlayWindow: NSWindow {
     public override var canBecomeKey: Bool { true }
     public override var canBecomeMain: Bool { true }
 
+    public override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
+    }
+
     public override func cancelOperation(_ sender: Any?) {
         onCancel?()
     }
@@ -63,11 +67,13 @@ public final class CaptureCoordinator {
                 backing: .buffered,
                 defer: false
             )
-            win.level = .screenSaver
+            win.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.maximumWindow)))
+            win.setFrame(frame, display: true)
             win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
             win.isOpaque = false
             win.backgroundColor = .clear
             win.hasShadow = false
+            win.ignoresMouseEvents = false
             win.acceptsMouseMovedEvents = true
             win.isReleasedWhenClosed = false
 
@@ -128,8 +134,8 @@ public final class CaptureCoordinator {
             return event
         }
 
-        NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
-        NSApp.activate(ignoringOtherApps: true)
+        NSRunningApplication.current.activate(options: [.activateAllWindows])
+        NSApp.activate()
         for win in overlayWindows {
             win.orderFrontRegardless()
         }

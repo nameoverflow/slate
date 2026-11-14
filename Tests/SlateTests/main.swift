@@ -438,6 +438,64 @@ func testCanvasEscapeCancelsInSelectingAndEditing() {
     checkEqual(cancelCount, 2, "cancelOperation cancels in editing phase")
 }
 
+func testCanvasTopEdgeSelectionAndFirstMouse() {
+    guard let screen = NSScreen.screens.first else {
+        check(false, "Need at least one NSScreen for top-edge test")
+        return
+    }
+    let boundsSize = NSSize(width: 800, height: 600)
+    let fullWinRect = CGRect(x: 0, y: 0, width: 800, height: 600)
+    let captured = CapturedScreen(
+        screen: screen,
+        displayID: CGMainDisplayID(),
+        image: makeDummyCGImage(pxW: 1600, pxH: 1200),
+        localWindows: [fullWinRect]
+    )
+
+    let window = CaptureOverlayWindow(
+        contentRect: NSRect(origin: .zero, size: boundsSize),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    let canvas = CaptureCanvasView(capturedScreen: captured, frame: NSRect(origin: .zero, size: boundsSize))
+    window.contentView = canvas
+
+    check(canvas.acceptsFirstMouse(for: nil), "Canvas accepts first mouse click immediately")
+    check(canvas.hitTest(NSPoint(x: 400, y: 600)) === canvas, "hitTest at exact top edge y=maxY hits canvas")
+    check(canvas.hitTest(NSPoint(x: 800, y: 600)) === canvas, "hitTest at exact top-right corner hits canvas")
+
+    // Dragging starting from exact top edge y=600 down to y=450 should enter editing phase and copy 200x150 (400x300 px)
+    var copiedImage: CGImage?
+    canvas.onCompleteWithCopy = { img in copiedImage = img }
+
+    let downEvt = NSEvent.mouseEvent(
+        with: .leftMouseDown, location: CGPoint(x: 100, y: 600), modifierFlags: [],
+        timestamp: 0.1, windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1
+    )!
+    let dragEvt = NSEvent.mouseEvent(
+        with: .leftMouseDragged, location: CGPoint(x: 300, y: 450), modifierFlags: [],
+        timestamp: 0.2, windowNumber: window.windowNumber, context: nil, eventNumber: 2, clickCount: 1, pressure: 1
+    )!
+    let upEvt = NSEvent.mouseEvent(
+        with: .leftMouseUp, location: CGPoint(x: 300, y: 450), modifierFlags: [],
+        timestamp: 0.25, windowNumber: window.windowNumber, context: nil, eventNumber: 3, clickCount: 1, pressure: 0
+    )!
+    canvas.mouseDown(with: downEvt)
+    canvas.mouseDragged(with: dragEvt)
+    canvas.mouseUp(with: upEvt)
+    check(canvas.phase == .editing, "Drag starting at top edge y=maxY enters editing phase")
+
+    let enterEvt = NSEvent.keyEvent(
+        with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0.3,
+        windowNumber: window.windowNumber, context: nil, characters: "\r",
+        charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: UInt16(kVK_Return)
+    )!
+    canvas.keyDown(with: enterEvt)
+    checkEqual(copiedImage?.width, 400, "Top-edge drag width in 2x pixels")
+    checkEqual(copiedImage?.height, 300, "Top-edge drag height in 2x pixels")
+}
+
 // Initialize NSApplication for AppKit view tests
 _ = NSApplication.shared
 
@@ -456,6 +514,7 @@ testCanvasClickWindowAndDoubleClickCopy()
 testCanvasDragCustomRectAndEnterCopy()
 testToolbarButtonDimensionsAndSnapshot(outputPath: renderPath)
 testCanvasEscapeCancelsInSelectingAndEditing()
+testCanvasTopEdgeSelectionAndFirstMouse()
 do {
     try testLaunchAtLoginManagerEnableDisable()
 } catch {
@@ -463,7 +522,7 @@ do {
 }
 
 if failureCount == 0 {
-    print("All 11 SlateTests passed.")
+    print("All 12 SlateTests passed.")
     exit(0)
 } else {
     fputs("\(failureCount) assertion(s) failed.\n", stderr)

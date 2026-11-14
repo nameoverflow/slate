@@ -29,6 +29,10 @@ A minimal, native macOS screenshot and annotation utility built with Swift, AppK
 ## Build & Install
 
 ```bash
+# Optional: create a persistent local code-signing cert so Screen Recording
+# permission survives rebuilds on this Mac:
+sh Scripts/setup-local-cert.sh
+
 ./build_app.sh
 cp -R dist/Slate.app /Applications/
 open /Applications/Slate.app

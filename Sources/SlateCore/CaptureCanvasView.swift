@@ -170,6 +170,19 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
 
     public override var acceptsFirstResponder: Bool { true }
 
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    public override func hitTest(_ point: NSPoint) -> NSView? {
+        if let hit = super.hitTest(point) {
+            return hit
+        }
+        let local = convert(point, from: superview)
+        if bounds.insetBy(dx: -2, dy: -2).contains(local) {
+            return self
+        }
+        return nil
+    }
+
     public func setInactiveOtherScreen(_ inactive: Bool) {
         isInactiveOtherScreen = inactive
         if inactive && phase == .selecting {
@@ -181,15 +194,15 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
     public func updateInitialHover(globalMouseLocation: CGPoint) {
         guard phase == .selecting else { return }
         let frame = capturedScreen.screen.frame
-        if frame.contains(globalMouseLocation) {
-            let local = CGPoint(
-                x: globalMouseLocation.x - frame.origin.x,
-                y: globalMouseLocation.y - frame.origin.y
+        if frame.insetBy(dx: -1, dy: -1).contains(globalMouseLocation) {
+            let local = SelectionGeometry.clampPoint(
+                CGPoint(
+                    x: globalMouseLocation.x - frame.origin.x,
+                    y: globalMouseLocation.y - frame.origin.y
+                ),
+                to: bounds
             )
-            hoveredWindowRect = WindowCoordinateHelper.hitTestLocalWindow(
-                atLocalPoint: local,
-                localWindows: capturedScreen.localWindows
-            )
+            hoveredWindowRect = hitTestWindow(at: local)
             needsDisplay = true
         }
     }
@@ -385,14 +398,27 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
 
     // MARK: - Mouse Handling
 
+    private func hitTestWindow(at pt: CGPoint) -> CGRect? {
+        let query = CGPoint(
+            x: min(max(bounds.minX, pt.x), max(bounds.minX, bounds.maxX - 0.5)),
+            y: min(max(bounds.minY, pt.y), max(bounds.minY, bounds.maxY - 0.5))
+        )
+        return WindowCoordinateHelper.hitTestLocalWindow(
+            atLocalPoint: query,
+            localWindows: capturedScreen.localWindows
+        )
+    }
+
+    private func clampedPoint(from event: NSEvent) -> CGPoint {
+        let raw = convert(event.locationInWindow, from: nil)
+        return SelectionGeometry.clampPoint(raw, to: bounds)
+    }
+
     public override func mouseMoved(with event: NSEvent) {
-        let pt = convert(event.locationInWindow, from: nil)
+        let pt = clampedPoint(from: event)
         if phase == .selecting {
             if isInactiveOtherScreen { return }
-            let hit = WindowCoordinateHelper.hitTestLocalWindow(
-                atLocalPoint: pt,
-                localWindows: capturedScreen.localWindows
-            )
+            let hit = hitTestWindow(at: pt)
             if hit != hoveredWindowRect {
                 hoveredWindowRect = hit
                 needsDisplay = true
@@ -410,6 +436,10 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
     }
 
     public override func mouseExited(with event: NSEvent) {
+        let globalMouse = NSEvent.mouseLocation
+        if capturedScreen.screen.frame.insetBy(dx: -1, dy: -1).contains(globalMouse) {
+            return
+        }
         if phase == .selecting && hoveredWindowRect != nil {
             hoveredWindowRect = nil
             needsDisplay = true
@@ -417,7 +447,7 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
     }
 
     public override func mouseDown(with event: NSEvent) {
-        let pt = convert(event.locationInWindow, from: nil)
+        let pt = clampedPoint(from: event)
         onBecameActiveScreen?()
         window?.makeFirstResponder(self)
 
@@ -506,7 +536,7 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
     }
 
     public override func mouseDragged(with event: NSEvent) {
-        let pt = convert(event.locationInWindow, from: nil)
+        let pt = clampedPoint(from: event)
 
         if phase == .selecting {
             let clamped = SelectionGeometry.clampPoint(pt, to: bounds)
