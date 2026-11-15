@@ -338,7 +338,7 @@ func testToolbarButtonDimensionsAndSnapshot(outputPath: String? = nil) {
 
     // Verify all icon buttons inside the main stack remain exact 28x28 and copy button 64x28.
     let frames = toolbar.mainButtonFramesForTesting
-    checkEqual(frames.count, 9, "Main toolbar has 9 buttons (5 tools + undo + save + cancel + copy)")
+    checkEqual(frames.count, 10, "Main toolbar has 10 buttons (6 tools + undo + save + cancel + copy)")
     for (name, btnSize) in frames {
         if name == "copy" {
             checkEqual(btnSize, CGSize(width: 64, height: 28), "Copy button size")
@@ -346,6 +346,12 @@ func testToolbarButtonDimensionsAndSnapshot(outputPath: String? = nil) {
             checkEqual(btnSize, CGSize(width: 28, height: 28), "Icon button \(name) size")
         }
     }
+
+    toolbar.setTool(.none)
+    toolbar.setHasSelectedAnnotation(false)
+    checkEqual(toolbar.requiredSize().height, 40, "Toolbar collapses style panel when none selected")
+    toolbar.setHasSelectedAnnotation(true)
+    check(toolbar.requiredSize().height > 40, "Toolbar reveals style panel when an annotation is selected")
 
     if let path = outputPath, let view = win.contentView,
        let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
@@ -496,6 +502,228 @@ func testCanvasTopEdgeSelectionAndFirstMouse() {
     checkEqual(copiedImage?.height, 300, "Top-edge drag height in 2x pixels")
 }
 
+func testAnnotationGeometryHitTestMoveResize() {
+    let bounds = CGRect(x: 0, y: 0, width: 500, height: 400)
+
+    let rectItem = AnnotationItem(
+        kind: .rectangle(CGRect(x: 100, y: 100, width: 120, height: 80)),
+        color: AnnotationColorPalette.colors[0],
+        lineWidth: 4
+    )
+    check(AnnotationGeometry.hitTest(rectItem, at: CGPoint(x: 100, y: 140)), "Rect border hits")
+    check(!AnnotationGeometry.hitTest(rectItem, at: CGPoint(x: 160, y: 140)), "Rect hollow interior does not hit")
+    checkEqual(
+        AnnotationGeometry.hitTestHandle(at: CGPoint(x: 221, y: 181), for: rectItem),
+        .corner(.topRight),
+        "Rect topRight handle hits"
+    )
+
+    let movedRect = AnnotationGeometry.moving(rectItem, by: CGPoint(x: 400, y: 400), within: bounds)
+    if case .rectangle(let r) = movedRect.kind {
+        checkEqual(r, CGRect(x: 380, y: 320, width: 120, height: 80), "Moved rect clamps inside bounds")
+    } else {
+        check(false, "Expected rectangle kind")
+    }
+
+    let resizedRect = AnnotationGeometry.resizing(
+        rectItem,
+        handle: .corner(.topRight),
+        to: CGPoint(x: 260, y: 220),
+        within: bounds
+    )
+    if case .rectangle(let r) = resizedRect.kind {
+        checkEqual(r, CGRect(x: 100, y: 100, width: 160, height: 120), "Resized rect updates corner")
+    } else {
+        check(false, "Expected rectangle kind")
+    }
+
+    let ellipseItem = AnnotationItem(
+        kind: .ellipse(CGRect(x: 100, y: 100, width: 100, height: 60)),
+        color: AnnotationColorPalette.colors[1],
+        lineWidth: 3
+    )
+    check(AnnotationGeometry.hitTest(ellipseItem, at: CGPoint(x: 150, y: 160)), "Ellipse top perimeter hits")
+    check(!AnnotationGeometry.hitTest(ellipseItem, at: CGPoint(x: 150, y: 130)), "Ellipse center does not hit")
+
+    let arrowItem = AnnotationItem(
+        kind: .arrow(start: CGPoint(x: 50, y: 50), end: CGPoint(x: 150, y: 50)),
+        color: AnnotationColorPalette.colors[4],
+        lineWidth: 4.5
+    )
+    check(AnnotationGeometry.hitTest(arrowItem, at: CGPoint(x: 100, y: 52)), "Arrow shaft hits")
+    checkEqual(
+        AnnotationGeometry.hitTestHandle(at: CGPoint(x: 151, y: 49), for: arrowItem),
+        .arrowEnd,
+        "Arrow end handle hits"
+    )
+    let reshapedArrow = AnnotationGeometry.resizing(
+        arrowItem,
+        handle: .arrowEnd,
+        to: CGPoint(x: 150, y: 150),
+        within: bounds
+    )
+    if case .arrow(let s, let e) = reshapedArrow.kind {
+        checkEqual(s, CGPoint(x: 50, y: 50), "Arrow start unchanged")
+        checkEqual(e, CGPoint(x: 150, y: 150), "Arrow end updated")
+    } else {
+        check(false, "Expected arrow kind")
+    }
+}
+
+func testCanvasAnnotationEditAndUndoFlow() {
+    guard let screen = NSScreen.screens.first else {
+        check(false, "Need at least one NSScreen for canvas edit test")
+        return
+    }
+    let boundsSize = NSSize(width: 800, height: 600)
+    let winRect = CGRect(x: 100, y: 100, width: 500, height: 400)
+    let captured = CapturedScreen(
+        screen: screen,
+        displayID: CGMainDisplayID(),
+        image: makeDummyCGImage(pxW: 1600, pxH: 1200),
+        localWindows: [winRect]
+    )
+
+    let window = CaptureOverlayWindow(
+        contentRect: NSRect(origin: .zero, size: boundsSize),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    let canvas = CaptureCanvasView(capturedScreen: captured, frame: NSRect(origin: .zero, size: boundsSize))
+    window.contentView = canvas
+
+    func mouse(_ type: NSEvent.EventType, x: CGFloat, y: CGFloat, clicks: Int = 1) -> NSEvent {
+        NSEvent.mouseEvent(
+            with: type,
+            location: CGPoint(x: x, y: y),
+            modifierFlags: [],
+            timestamp: 0.1,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: clicks,
+            pressure: type == .leftMouseUp ? 0 : 1
+        )!
+    }
+
+    // Enter editing phase on winRect (100, 100, 500, 400)
+    canvas.mouseMoved(with: mouse(.mouseMoved, x: 200, y: 200, clicks: 0))
+    canvas.mouseDown(with: mouse(.leftMouseDown, x: 200, y: 200))
+    canvas.mouseUp(with: mouse(.leftMouseUp, x: 200, y: 200))
+    check(canvas.phase == .editing, "Entered editing phase")
+    check(!canvas.canUndoForTesting, "Undo disabled initially")
+    check(!canvas.toolbarForTesting.isUndoEnabledForTesting, "Undo button disabled initially")
+
+    // 1. Draw a rectangle from (150, 150) to (250, 250)
+    canvas.setToolForTesting(.rectangle)
+    canvas.mouseDown(with: mouse(.leftMouseDown, x: 150, y: 150))
+    canvas.mouseDragged(with: mouse(.leftMouseDragged, x: 250, y: 250))
+    canvas.mouseUp(with: mouse(.leftMouseUp, x: 250, y: 250))
+    checkEqual(canvas.annotationsForTesting.count, 1, "Rectangle added")
+    check(canvas.selectedAnnotationIDForTesting == canvas.annotationsForTesting[0].id, "New rectangle auto-selected")
+    check(canvas.toolbarForTesting.isUndoEnabledForTesting, "Undo button enabled after draw")
+
+    // 2. Resize rectangle topRight handle from (250, 250) to (300, 280)
+    canvas.mouseDown(with: mouse(.leftMouseDown, x: 250, y: 250))
+    canvas.mouseDragged(with: mouse(.leftMouseDragged, x: 300, y: 280))
+    canvas.mouseUp(with: mouse(.leftMouseUp, x: 300, y: 280))
+    if case .rectangle(let r) = canvas.annotationsForTesting[0].kind {
+        checkEqual(r, CGRect(x: 150, y: 150, width: 150, height: 130), "Rectangle resized via handle")
+    } else {
+        check(false, "Expected rectangle")
+    }
+
+    // 3. Move rectangle by dragging its left edge (150, 200) -> (180, 220)
+    canvas.mouseDown(with: mouse(.leftMouseDown, x: 150, y: 200))
+    canvas.mouseDragged(with: mouse(.leftMouseDragged, x: 180, y: 220))
+    canvas.mouseUp(with: mouse(.leftMouseUp, x: 180, y: 220))
+    if case .rectangle(let r) = canvas.annotationsForTesting[0].kind {
+        checkEqual(r, CGRect(x: 180, y: 170, width: 150, height: 130), "Rectangle moved via border drag")
+    } else {
+        check(false, "Expected rectangle")
+    }
+
+    // 4. Draw an arrow from (350, 200) to (450, 260)
+    canvas.setToolForTesting(.arrow)
+    canvas.mouseDown(with: mouse(.leftMouseDown, x: 350, y: 200))
+    canvas.mouseDragged(with: mouse(.leftMouseDragged, x: 450, y: 260))
+    canvas.mouseUp(with: mouse(.leftMouseUp, x: 450, y: 260))
+    checkEqual(canvas.annotationsForTesting.count, 2, "Arrow added")
+
+    // 5. Drag arrow end handle from (450, 260) to (480, 320)
+    canvas.mouseDown(with: mouse(.leftMouseDown, x: 450, y: 260))
+    canvas.mouseDragged(with: mouse(.leftMouseDragged, x: 480, y: 320))
+    canvas.mouseUp(with: mouse(.leftMouseUp, x: 480, y: 320))
+    if case .arrow(let s, let e) = canvas.annotationsForTesting[1].kind {
+        checkEqual(s, CGPoint(x: 350, y: 200), "Arrow start kept")
+        checkEqual(e, CGPoint(x: 480, y: 320), "Arrow end adjusted")
+    } else {
+        check(false, "Expected arrow")
+    }
+
+    // 6. Change selected arrow color and thickness
+    let greenColor = AnnotationColorPalette.colors[3]
+    canvas.toolbarForTesting.onSelectColor?(greenColor)
+    canvas.toolbarForTesting.onSelectThickness?(.thick)
+    check(AnnotationColorPalette.colorsMatch(canvas.annotationsForTesting[1].color, greenColor), "Arrow color updated")
+    checkEqual(canvas.annotationsForTesting[1].lineWidth, StrokeThickness.thick.lineWidth, "Arrow thickness updated")
+
+    // 7. Delete selected arrow with Delete key, then undo step-by-step via toolbar Undo button
+    let delEvt = NSEvent.keyEvent(
+        with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0.5,
+        windowNumber: window.windowNumber, context: nil, characters: "\u{7f}",
+        charactersIgnoringModifiers: "\u{7f}", isARepeat: false, keyCode: UInt16(kVK_Delete)
+    )!
+    canvas.keyDown(with: delEvt)
+    checkEqual(canvas.annotationsForTesting.count, 1, "Delete key removes selected arrow")
+
+    // Undo #1: restore deleted arrow
+    canvas.toolbarForTesting.simulateUndoClickForTesting()
+    checkEqual(canvas.annotationsForTesting.count, 2, "Undo #1 restores deleted arrow")
+
+    // Undo #2: revert thickness -> medium
+    canvas.toolbarForTesting.simulateUndoClickForTesting()
+    checkEqual(canvas.annotationsForTesting[1].lineWidth, StrokeThickness.medium.lineWidth, "Undo #2 reverts thickness")
+
+    // Undo #3: revert color -> red
+    canvas.toolbarForTesting.simulateUndoClickForTesting()
+    check(AnnotationColorPalette.colorsMatch(canvas.annotationsForTesting[1].color, AnnotationColorPalette.colors[0]), "Undo #3 reverts color")
+
+    // Undo #4: revert arrow endpoint adjustment
+    canvas.toolbarForTesting.simulateUndoClickForTesting()
+    if case .arrow(_, let e) = canvas.annotationsForTesting[1].kind {
+        checkEqual(e, CGPoint(x: 450, y: 260), "Undo #4 reverts arrow endpoint")
+    } else {
+        check(false, "Expected arrow")
+    }
+
+    // Undo #5: remove arrow
+    canvas.toolbarForTesting.simulateUndoClickForTesting()
+    checkEqual(canvas.annotationsForTesting.count, 1, "Undo #5 removes arrow")
+
+    // Undo #6: revert rectangle move
+    canvas.toolbarForTesting.simulateUndoClickForTesting()
+    if case .rectangle(let r) = canvas.annotationsForTesting[0].kind {
+        checkEqual(r, CGRect(x: 150, y: 150, width: 150, height: 130), "Undo #6 reverts rectangle move")
+    } else {
+        check(false, "Expected rectangle")
+    }
+
+    // Undo #7: revert rectangle resize
+    canvas.toolbarForTesting.simulateUndoClickForTesting()
+    if case .rectangle(let r) = canvas.annotationsForTesting[0].kind {
+        checkEqual(r, CGRect(x: 150, y: 150, width: 100, height: 100), "Undo #7 reverts rectangle resize")
+    } else {
+        check(false, "Expected rectangle")
+    }
+
+    // Undo #8: remove rectangle
+    canvas.toolbarForTesting.simulateUndoClickForTesting()
+    checkEqual(canvas.annotationsForTesting.count, 0, "Undo #8 removes rectangle")
+    check(!canvas.toolbarForTesting.isUndoEnabledForTesting, "Undo button disabled when history is empty")
+}
+
 // Initialize NSApplication for AppKit view tests
 _ = NSApplication.shared
 
@@ -515,6 +743,8 @@ testCanvasDragCustomRectAndEnterCopy()
 testToolbarButtonDimensionsAndSnapshot(outputPath: renderPath)
 testCanvasEscapeCancelsInSelectingAndEditing()
 testCanvasTopEdgeSelectionAndFirstMouse()
+testAnnotationGeometryHitTestMoveResize()
+testCanvasAnnotationEditAndUndoFlow()
 do {
     try testLaunchAtLoginManagerEnableDisable()
 } catch {
@@ -522,7 +752,7 @@ do {
 }
 
 if failureCount == 0 {
-    print("All 12 SlateTests passed.")
+    print("All 14 SlateTests passed.")
     exit(0)
 } else {
     fputs("\(failureCount) assertion(s) failed.\n", stderr)

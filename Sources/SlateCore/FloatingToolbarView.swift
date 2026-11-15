@@ -8,7 +8,7 @@ private final class ToolbarIconButton: NSView {
     }
     var isEnabledState = true {
         didSet {
-            alphaValue = isEnabledState ? 1.0 : 0.35
+            alphaValue = isEnabledState ? 1.0 : 0.48
             updateBackground()
         }
     }
@@ -272,6 +272,7 @@ public final class FloatingToolbarView: NSView {
     public private(set) var selectedTool: AnnotationTool = .none
     public private(set) var selectedColor: NSColor = AnnotationColorPalette.colors[0]
     public private(set) var selectedThickness: StrokeThickness = .medium
+    public private(set) var hasSelectedAnnotation: Bool = false
 
     private let mainPanel = NSVisualEffectView()
     private let stylePanel = NSVisualEffectView()
@@ -292,8 +293,12 @@ public final class FloatingToolbarView: NSView {
     private let mainHorizontalPadding: CGFloat = 8
     private let styleHorizontalPadding: CGFloat = 10
 
-    private var mainPanelWidth: CGFloat = 356
+    private var mainPanelWidth: CGFloat = 388
     private var stylePanelWidth: CGFloat = 258
+
+    private var showsStylePanel: Bool {
+        selectedTool != .none || hasSelectedAnnotation
+    }
 
     public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -307,7 +312,7 @@ public final class FloatingToolbarView: NSView {
     }
 
     public func requiredSize() -> CGSize {
-        let showStyle = selectedTool != .none
+        let showStyle = showsStylePanel
         let width = max(mainPanelWidth, showStyle ? stylePanelWidth : 0)
         let height = showStyle ? (mainHeight + spacing + styleHeight) : mainHeight
         return CGSize(width: ceil(width), height: ceil(height))
@@ -316,10 +321,32 @@ public final class FloatingToolbarView: NSView {
     public func setTool(_ tool: AnnotationTool) {
         selectedTool = tool
         updateSelections()
+        needsLayout = true
+    }
+
+    public func setHasSelectedAnnotation(_ hasSelection: Bool) {
+        hasSelectedAnnotation = hasSelection
+        needsLayout = true
+    }
+
+    public func setStyle(color: NSColor, thickness: StrokeThickness) {
+        selectedColor = color
+        selectedThickness = thickness
+        updateSelections()
     }
 
     public func setCanUndo(_ canUndo: Bool) {
         undoButton.isEnabledState = canUndo
+    }
+
+    public var isUndoEnabledForTesting: Bool {
+        undoButton.isEnabledState
+    }
+
+    public func simulateUndoClickForTesting() {
+        if undoButton.isEnabledState {
+            onUndo?()
+        }
     }
 
     /// Returns frames of main action buttons for layout verification in tests.
@@ -364,7 +391,7 @@ public final class FloatingToolbarView: NSView {
 
     public override func layout() {
         super.layout()
-        let showStyle = selectedTool != .none
+        let showStyle = showsStylePanel
         stylePanel.isHidden = !showStyle
         if showStyle {
             mainPanel.frame = CGRect(x: 0, y: styleHeight + spacing, width: mainPanelWidth, height: mainHeight)
@@ -407,6 +434,7 @@ public final class FloatingToolbarView: NSView {
         ])
 
         let toolSpecs: [(AnnotationTool, String, String)] = [
+            (.none, "cursorarrow", "选择与调整"),
             (.rectangle, "square", "方框"),
             (.ellipse, "circle", "圆圈"),
             (.arrow, "arrow.up.right", "箭头"),
@@ -418,7 +446,11 @@ public final class FloatingToolbarView: NSView {
             let btn = ToolbarIconButton(symbolName: symbol, tooltip: tip)
             btn.onClick = { [weak self] in
                 guard let self = self else { return }
-                self.selectedTool = (self.selectedTool == tool) ? .none : tool
+                if tool == .none {
+                    self.selectedTool = .none
+                } else {
+                    self.selectedTool = (self.selectedTool == tool) ? .none : tool
+                }
                 self.updateSelections()
                 self.onSelectTool?(self.selectedTool)
             }
@@ -526,7 +558,7 @@ public final class FloatingToolbarView: NSView {
             btn.isSelectedState = (thickness == selectedThickness)
         }
         for (color, btn) in colorButtons {
-            btn.isSelectedState = (color == selectedColor)
+            btn.isSelectedState = AnnotationColorPalette.colorsMatch(color, selectedColor)
         }
     }
 }

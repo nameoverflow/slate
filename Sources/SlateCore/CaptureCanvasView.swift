@@ -140,22 +140,48 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
     private var moveOffset: CGPoint = .zero
 
     // Annotation state
+    private struct AnnotationSnapshot {
+        let annotations: [AnnotationItem]
+        let selectedAnnotationID: UUID?
+    }
+
     private var activeTool: AnnotationTool = .none
     private var currentColor: NSColor = AnnotationColorPalette.colors[0]
     private var currentThickness: StrokeThickness = .medium
     private var annotations: [AnnotationItem] = []
+    private var undoStack: [AnnotationSnapshot] = []
     private var inProgressAnnotation: AnnotationItem?
     private var drawStartPoint: CGPoint = .zero
     private var brushPoints: [CGPoint] = []
+
+    // Annotation adjustment state
+    private var selectedAnnotationID: UUID?
+    private var activeAnnotationHandle: AnnotationHandle?
+    private var isMovingAnnotation = false
+    private var annotationDragStartPoint: CGPoint = .zero
+    private var initialAnnotationBeforeDrag: AnnotationItem?
+    private var annotationsBeforeDrag: [AnnotationItem]?
 
     // Inline text editor
     private var activeTextView: InlineAnnotationTextView?
     private var activeTextContainer: NSView?
     private var activeTextOrigin: CGPoint = .zero
     private var activeTextFontSize: CGFloat = 20
+    private var editingTextAnnotationID: UUID?
+    private var annotationsBeforeTextEdit: [AnnotationItem]?
 
     private let toolbar = FloatingToolbarView(frame: .zero)
     private var trackingAreaRef: NSTrackingArea?
+
+    public var annotationsForTesting: [AnnotationItem] { annotations }
+    public var selectedAnnotationIDForTesting: UUID? { selectedAnnotationID }
+    public var canUndoForTesting: Bool { !undoStack.isEmpty }
+    public var toolbarForTesting: FloatingToolbarView { toolbar }
+
+    public func setToolForTesting(_ tool: AnnotationTool) {
+        toolbar.setTool(tool)
+        toolbar.onSelectTool?(tool)
+    }
 
     public init(capturedScreen: CapturedScreen, frame: NSRect) {
         self.capturedScreen = capturedScreen
@@ -239,14 +265,28 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
             guard let self = self else { return }
             self.commitActiveTextIfNeeded()
             self.activeTool = tool
+            if tool != .none {
+                self.selectAnnotation(nil)
+            }
             self.repositionToolbar()
             self.window?.makeFirstResponder(self)
+            self.needsDisplay = true
         }
         toolbar.onSelectColor = { [weak self] color in
             guard let self = self else { return }
             self.currentColor = color
-            self.activeTextView?.textColor = color
-            self.activeTextView?.insertionPointColor = color
+            if let tv = self.activeTextView {
+                tv.textColor = color
+                tv.insertionPointColor = color
+            } else if let selID = self.selectedAnnotationID,
+                      let idx = self.annotations.firstIndex(where: { $0.id == selID }) {
+                let updated = AnnotationGeometry.updatingStyle(self.annotations[idx], color: color, within: self.selectionRect)
+                if updated != self.annotations[idx] {
+                    self.pushUndoSnapshot()
+                    self.annotations[idx] = updated
+                    self.needsDisplay = true
+                }
+            }
         }
         toolbar.onSelectThickness = { [weak self] thickness in
             guard let self = self else { return }
@@ -255,10 +295,18 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
                 tv.font = .systemFont(ofSize: thickness.fontSize, weight: .semibold)
                 self.activeTextFontSize = thickness.fontSize
                 self.resizeActiveTextContainer()
+            } else if let selID = self.selectedAnnotationID,
+                      let idx = self.annotations.firstIndex(where: { $0.id == selID }) {
+                let updated = AnnotationGeometry.updatingStyle(self.annotations[idx], thickness: thickness, within: self.selectionRect)
+                if updated != self.annotations[idx] {
+                    self.pushUndoSnapshot()
+                    self.annotations[idx] = updated
+                    self.needsDisplay = true
+                }
             }
         }
         toolbar.onUndo = { [weak self] in
-            self?.undoLastAnnotation()
+            self?.undoLastAction()
         }
         toolbar.onSave = { [weak self] in
             self?.performSave()
@@ -320,7 +368,7 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
         if phase == .editing {
             ctx.saveGState()
             ctx.clip(to: selectionRect)
-            for item in annotations {
+            for item in annotations where item.id != editingTextAnnotationID {
                 AnnotationRenderer.draw(item, in: ctx)
             }
             if let current = inProgressAnnotation {
@@ -332,6 +380,14 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
         // 5. Draw border, handles, and dimension badge.
         if let rect = brightRect, rect.width > 0, rect.height > 0 {
             drawSelectionChrome(rect: rect, in: ctx)
+        }
+
+        // 6. Draw handles for the selected annotation above selection chrome.
+        if phase == .editing,
+           let selID = selectedAnnotationID,
+           selID != editingTextAnnotationID,
+           let selectedItem = annotations.first(where: { $0.id == selID }) {
+            AnnotationRenderer.drawSelectionChrome(for: selectedItem, in: ctx)
         }
     }
 
@@ -465,6 +521,10 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
                container.frame.contains(pt), !tv.string.isEmpty {
                 return
             }
+            if activeTextView == nil, let textItem = hitTestTextAnnotation(at: pt) {
+                beginEditingExistingText(textItem)
+                return
+            }
             cancelActiveTextIfNeeded()
             inProgressAnnotation = nil
             performCopy()
@@ -478,7 +538,7 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
             }
         }
 
-        // Check resize handles first (even when an annotation tool is active).
+        // Check crop selection resize handles first.
         if let handle = SelectionGeometry.hitTestHandle(at: pt, in: selectionRect) {
             commitActiveTextIfNeeded()
             activeHandle = handle
@@ -487,7 +547,44 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
             return
         }
 
-        guard selectionRect.contains(pt) else { return }
+        // Check handles of the currently selected annotation.
+        if let selID = selectedAnnotationID,
+           let selectedItem = annotations.first(where: { $0.id == selID }),
+           let handle = AnnotationGeometry.hitTestHandle(at: pt, for: selectedItem) {
+            activeAnnotationHandle = handle
+            initialAnnotationBeforeDrag = selectedItem
+            annotationsBeforeDrag = annotations
+            annotationDragStartPoint = pt
+            toolbar.isHidden = true
+            return
+        }
+
+        // Check hit-test on existing annotations (skip while scribbling with brush).
+        if activeTool != .brush, let hitItem = hitTestAnnotation(at: pt) {
+            selectAnnotation(hitItem.id)
+            isMovingAnnotation = true
+            initialAnnotationBeforeDrag = hitItem
+            annotationsBeforeDrag = annotations
+            annotationDragStartPoint = pt
+            toolbar.isHidden = true
+            needsDisplay = true
+            return
+        }
+
+        guard selectionRect.contains(pt) else {
+            if selectedAnnotationID != nil {
+                selectAnnotation(nil)
+                repositionToolbar()
+                needsDisplay = true
+            }
+            return
+        }
+
+        if selectedAnnotationID != nil {
+            selectAnnotation(nil)
+            repositionToolbar()
+            needsDisplay = true
+        }
 
         if activeTool == .none {
             isMovingSelection = true
@@ -573,6 +670,36 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
             return
         }
 
+        if let handle = activeAnnotationHandle,
+           let selID = selectedAnnotationID,
+           let idx = annotations.firstIndex(where: { $0.id == selID }),
+           let initial = initialAnnotationBeforeDrag {
+            let snap = event.modifierFlags.contains(.shift)
+            annotations[idx] = AnnotationGeometry.resizing(
+                initial,
+                handle: handle,
+                to: pt,
+                within: selectionRect,
+                snapAngle: snap
+            )
+            needsDisplay = true
+            return
+        }
+
+        if isMovingAnnotation,
+           let selID = selectedAnnotationID,
+           let idx = annotations.firstIndex(where: { $0.id == selID }),
+           let initial = initialAnnotationBeforeDrag {
+            let delta = CGPoint(
+                x: pt.x - annotationDragStartPoint.x,
+                y: pt.y - annotationDragStartPoint.y
+            )
+            annotations[idx] = AnnotationGeometry.moving(initial, by: delta, within: selectionRect)
+            NSCursor.closedHand.set()
+            needsDisplay = true
+            return
+        }
+
         guard var current = inProgressAnnotation else { return }
         let clamped = SelectionGeometry.clampPoint(pt, to: selectionRect)
         let keepAspect = event.modifierFlags.contains(.shift)
@@ -585,7 +712,7 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
             let endPt = keepAspect ? squareConstrainedPoint(from: drawStartPoint, to: clamped) : clamped
             current.kind = .ellipse(SelectionGeometry.normalizedRect(from: drawStartPoint, to: endPt))
         case .arrow:
-            let endPt = keepAspect ? angleSnappedPoint(from: drawStartPoint, to: clamped) : clamped
+            let endPt = keepAspect ? AnnotationGeometry.angleSnappedPoint(from: drawStartPoint, to: clamped, bounds: selectionRect) : clamped
             current.kind = .arrow(start: drawStartPoint, end: endPt)
         case .brush:
             if let last = brushPoints.last, hypot(clamped.x - last.x, clamped.y - last.y) >= 1.5 {
@@ -635,6 +762,24 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
             return
         }
 
+        if activeAnnotationHandle != nil || isMovingAnnotation {
+            if let before = annotationsBeforeDrag, before != annotations {
+                undoStack.append(AnnotationSnapshot(
+                    annotations: before,
+                    selectedAnnotationID: selectedAnnotationID
+                ))
+                toolbar.setCanUndo(!undoStack.isEmpty)
+            }
+            activeAnnotationHandle = nil
+            isMovingAnnotation = false
+            initialAnnotationBeforeDrag = nil
+            annotationsBeforeDrag = nil
+            repositionToolbar()
+            updateEditingCursor(at: clampedPoint(from: event))
+            needsDisplay = true
+            return
+        }
+
         if let current = inProgressAnnotation {
             inProgressAnnotation = nil
             let shouldCommit: Bool
@@ -649,8 +794,14 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
                 shouldCommit = false
             }
             if shouldCommit {
+                pushUndoSnapshot()
                 annotations.append(current)
-                toolbar.setCanUndo(!annotations.isEmpty)
+                if case .brush = current.kind {
+                    selectAnnotation(nil)
+                } else {
+                    selectAnnotation(current.id)
+                }
+                repositionToolbar()
             }
             needsDisplay = true
         }
@@ -677,6 +828,12 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
         }
 
         if phase == .editing {
+            if (event.keyCode == UInt16(kVK_Delete) || event.keyCode == UInt16(kVK_ForwardDelete))
+                && activeTextView == nil
+                && selectedAnnotationID != nil {
+                deleteSelectedAnnotation()
+                return
+            }
             if event.keyCode == UInt16(kVK_Return) || event.keyCode == UInt16(kVK_ANSI_KeypadEnter) {
                 performCopy()
                 return
@@ -684,7 +841,7 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             if flags == .command {
                 if event.charactersIgnoringModifiers?.lowercased() == "z" {
-                    undoLastAnnotation()
+                    undoLastAction()
                     return
                 }
                 if event.charactersIgnoringModifiers?.lowercased() == "s" {
@@ -713,21 +870,56 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
         let originX = max(selectionRect.minX + 4, min(point.x, selectionRect.maxX - initW - 4))
         let originY = max(selectionRect.minY + 4, min(point.y - initH * 0.5, selectionRect.maxY - initH - 4))
 
-        let container = NSView(frame: CGRect(x: originX, y: originY, width: initW, height: initH))
+        openTextEditor(
+            frame: CGRect(x: originX, y: originY, width: initW, height: initH),
+            initialText: "",
+            color: currentColor,
+            fontSize: fontSize
+        )
+    }
+
+    private func beginEditingExistingText(_ item: AnnotationItem) {
+        guard case .text(let rect, let string, let fontSize) = item.kind else { return }
+        commitActiveTextIfNeeded()
+
+        editingTextAnnotationID = item.id
+        annotationsBeforeTextEdit = annotations
+        currentColor = item.color
+        currentThickness = AnnotationColorPalette.nearestThickness(for: item)
+        toolbar.setStyle(color: currentColor, thickness: currentThickness)
+
+        let width = max(80, min(rect.width + 12, selectionRect.width - 8))
+        let height = max(fontSize + 14, rect.height + 6)
+        let originX = max(selectionRect.minX + 4, min(rect.minX - 6, selectionRect.maxX - width - 4))
+        let originY = max(selectionRect.minY + 4, min(rect.minY - 4, selectionRect.maxY - height - 4))
+
+        openTextEditor(
+            frame: CGRect(x: originX, y: originY, width: width, height: height),
+            initialText: string,
+            color: item.color,
+            fontSize: fontSize
+        )
+        resizeActiveTextContainer()
+        needsDisplay = true
+    }
+
+    private func openTextEditor(frame: CGRect, initialText: String, color: NSColor, fontSize: CGFloat) {
+        let container = NSView(frame: frame)
         container.wantsLayer = true
         container.layer?.borderColor = NSColor.white.withAlphaComponent(0.8).cgColor
         container.layer?.borderWidth = 1.0
         container.layer?.cornerRadius = 4
         container.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.25).cgColor
 
-        let tv = InlineAnnotationTextView(frame: CGRect(x: 4, y: 2, width: initW - 8, height: initH - 4))
+        let tv = InlineAnnotationTextView(frame: CGRect(x: 4, y: 2, width: frame.width - 8, height: frame.height - 4))
         tv.drawsBackground = false
         tv.isRichText = false
         tv.isFieldEditor = false
         tv.allowsUndo = true
         tv.font = .systemFont(ofSize: fontSize, weight: .semibold)
-        tv.textColor = currentColor
-        tv.insertionPointColor = currentColor
+        tv.textColor = color
+        tv.insertionPointColor = color
+        tv.string = initialText
         tv.textContainer?.widthTracksTextView = true
         tv.textContainer?.lineFragmentPadding = 2
         tv.isVerticallyResizable = true
@@ -746,7 +938,7 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
 
         activeTextContainer = container
         activeTextView = tv
-        activeTextOrigin = CGPoint(x: originX, y: originY)
+        activeTextOrigin = frame.origin
         activeTextFontSize = fontSize
         onTextEditingChanged?(true)
 
@@ -773,31 +965,60 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
 
     private func commitActiveTextIfNeeded() {
         guard let tv = activeTextView, let container = activeTextContainer else { return }
-        let text = tv.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !text.isEmpty {
-            let textRect = CGRect(
-                x: container.frame.minX + 6,
-                y: container.frame.minY + 4,
-                width: container.frame.width - 12,
-                height: container.frame.height - 6
-            )
-            annotations.append(AnnotationItem(
+        let trimmed = tv.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        let textRect = CGRect(
+            x: container.frame.minX + 6,
+            y: container.frame.minY + 4,
+            width: container.frame.width - 12,
+            height: container.frame.height - 6
+        )
+
+        if let editID = editingTextAnnotationID, let before = annotationsBeforeTextEdit {
+            editingTextAnnotationID = nil
+            annotationsBeforeTextEdit = nil
+            if trimmed.isEmpty {
+                undoStack.append(AnnotationSnapshot(annotations: before, selectedAnnotationID: editID))
+                annotations.removeAll { $0.id == editID }
+                selectAnnotation(nil)
+            } else if let idx = annotations.firstIndex(where: { $0.id == editID }) {
+                let updated = AnnotationItem(
+                    id: editID,
+                    kind: .text(rect: textRect, string: tv.string, fontSize: activeTextFontSize),
+                    color: currentColor,
+                    lineWidth: currentThickness.lineWidth
+                )
+                if updated != annotations[idx] {
+                    undoStack.append(AnnotationSnapshot(annotations: before, selectedAnnotationID: editID))
+                    annotations[idx] = updated
+                }
+                selectAnnotation(editID)
+            }
+            toolbar.setCanUndo(!undoStack.isEmpty)
+        } else if !trimmed.isEmpty {
+            pushUndoSnapshot()
+            let item = AnnotationItem(
                 kind: .text(rect: textRect, string: tv.string, fontSize: activeTextFontSize),
                 color: currentColor,
                 lineWidth: currentThickness.lineWidth
-            ))
-            toolbar.setCanUndo(!annotations.isEmpty)
+            )
+            annotations.append(item)
+            selectAnnotation(item.id)
+            toolbar.setCanUndo(!undoStack.isEmpty)
         }
+
         container.removeFromSuperview()
         activeTextView = nil
         activeTextContainer = nil
         onTextEditingChanged?(false)
+        repositionToolbar()
         window?.makeFirstResponder(self)
         needsDisplay = true
     }
 
     private func cancelActiveTextIfNeeded() {
         let wasEditing = activeTextView != nil
+        editingTextAnnotationID = nil
+        annotationsBeforeTextEdit = nil
         activeTextContainer?.removeFromSuperview()
         activeTextView = nil
         activeTextContainer = nil
@@ -805,9 +1026,49 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
             onTextEditingChanged?(false)
         }
         window?.makeFirstResponder(self)
+        needsDisplay = true
     }
 
     // MARK: - Actions & Helpers
+
+    private func hitTestAnnotation(at pt: CGPoint) -> AnnotationItem? {
+        annotations.last(where: { AnnotationGeometry.hitTest($0, at: pt) })
+    }
+
+    private func hitTestTextAnnotation(at pt: CGPoint) -> AnnotationItem? {
+        annotations.last(where: {
+            if case .text = $0.kind {
+                return AnnotationGeometry.hitTest($0, at: pt)
+            }
+            return false
+        })
+    }
+
+    private func selectAnnotation(_ id: UUID?) {
+        selectedAnnotationID = id
+        if let id = id, let item = annotations.first(where: { $0.id == id }) {
+            toolbar.setHasSelectedAnnotation(true)
+            toolbar.setStyle(color: item.color, thickness: AnnotationColorPalette.nearestThickness(for: item))
+        } else {
+            toolbar.setHasSelectedAnnotation(false)
+            toolbar.setStyle(color: currentColor, thickness: currentThickness)
+        }
+    }
+
+    private func pushUndoSnapshot() {
+        undoStack.append(AnnotationSnapshot(annotations: annotations, selectedAnnotationID: selectedAnnotationID))
+        toolbar.setCanUndo(true)
+    }
+
+    private func deleteSelectedAnnotation() {
+        guard let selID = selectedAnnotationID,
+              annotations.contains(where: { $0.id == selID }) else { return }
+        pushUndoSnapshot()
+        annotations.removeAll { $0.id == selID }
+        selectAnnotation(nil)
+        repositionToolbar()
+        needsDisplay = true
+    }
 
     private func enterEditingPhase() {
         phase = .editing
@@ -819,14 +1080,21 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
         needsDisplay = true
     }
 
-    private func undoLastAnnotation() {
+    private func undoLastAction() {
         if activeTextView != nil {
             cancelActiveTextIfNeeded()
             return
         }
-        guard !annotations.isEmpty else { return }
-        annotations.removeLast()
-        toolbar.setCanUndo(!annotations.isEmpty)
+        guard let previous = undoStack.popLast() else { return }
+        annotations = previous.annotations
+        if let prevSel = previous.selectedAnnotationID,
+           annotations.contains(where: { $0.id == prevSel }) {
+            selectAnnotation(prevSel)
+        } else {
+            selectAnnotation(nil)
+        }
+        toolbar.setCanUndo(!undoStack.isEmpty)
+        repositionToolbar()
         needsDisplay = true
     }
 
@@ -852,11 +1120,22 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
 
     private func updateEditingCursor(at pt: CGPoint) {
         if let handle = SelectionGeometry.hitTestHandle(at: pt, in: selectionRect) {
+            cursor(for: handle).set()
+            return
+        }
+        if let selID = selectedAnnotationID,
+           let selectedItem = annotations.first(where: { $0.id == selID }),
+           let handle = AnnotationGeometry.hitTestHandle(at: pt, for: selectedItem) {
             switch handle {
-            case .top, .bottom: NSCursor.resizeUpDown.set()
-            case .left, .right: NSCursor.resizeLeftRight.set()
-            case .topLeft, .bottomRight, .topRight, .bottomLeft: NSCursor.crosshair.set()
+            case .corner(let corner):
+                cursor(for: corner).set()
+            case .arrowStart, .arrowEnd:
+                NSCursor.crosshair.set()
             }
+            return
+        }
+        if activeTool != .brush, hitTestAnnotation(at: pt) != nil {
+            NSCursor.openHand.set()
             return
         }
         if selectionRect.contains(pt) {
@@ -872,6 +1151,14 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
         NSCursor.arrow.set()
     }
 
+    private func cursor(for handle: SelectionHandle) -> NSCursor {
+        switch handle {
+        case .top, .bottom: return .resizeUpDown
+        case .left, .right: return .resizeLeftRight
+        case .topLeft, .bottomRight, .topRight, .bottomLeft: return .crosshair
+        }
+    }
+
     private func squareConstrainedPoint(from start: CGPoint, to end: CGPoint) -> CGPoint {
         let dx = end.x - start.x
         let dy = end.y - start.y
@@ -880,16 +1167,6 @@ public final class CaptureCanvasView: NSView, NSTextViewDelegate {
             x: start.x + (dx >= 0 ? side : -side),
             y: start.y + (dy >= 0 ? side : -side)
         )
-        return SelectionGeometry.clampPoint(candidate, to: selectionRect)
-    }
-
-    private func angleSnappedPoint(from start: CGPoint, to end: CGPoint) -> CGPoint {
-        let dx = end.x - start.x
-        let dy = end.y - start.y
-        let len = hypot(dx, dy)
-        let angle = atan2(dy, dx)
-        let snapped = round(angle / (.pi / 4)) * (.pi / 4)
-        let candidate = CGPoint(x: start.x + cos(snapped) * len, y: start.y + sin(snapped) * len)
         return SelectionGeometry.clampPoint(candidate, to: selectionRect)
     }
 }
