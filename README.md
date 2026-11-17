@@ -26,6 +26,19 @@ A minimal, native macOS screenshot and annotation utility built with Swift, AppK
 - macOS 14.0+ (built & tested on macOS 26.5 / Apple Silicon)
 - Swift 6.0+ / Xcode Command Line Tools
 
+## Downloads and releases
+
+Apple Silicon (arm64) packages are published on [GitHub Releases](https://github.com/nameoverflow/slate/releases).
+Extract `Slate-macos-arm64.zip` and move `Slate.app` to `/Applications`.
+Release builds are ad-hoc signed, without Apple notarization; macOS Gatekeeper may require explicit approval.
+
+The `macOS CI and Release` workflow runs `SlateTests`, builds the app, and verifies
+the packaged app on every pull request and push to `main`. Pushing a
+`vMAJOR.MINOR.PATCH` tag (for example, `v0.1.0`) runs the same checks and publishes
+the ZIP and SHA-256 checksum only after they pass. The tag supplies the bundle
+version. Manual workflow runs build the selected ref and publish only when that
+ref is a version tag.
+
 ## Build & Install
 
 ```bash
